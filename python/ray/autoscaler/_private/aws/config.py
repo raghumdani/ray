@@ -201,6 +201,7 @@ def log_to_cli(config: Dict[str, Any]) -> None:
         profile_name = _arn_to_name(profile_arn) if profile_arn else IamProfile["Name"]
         cli_logger.labeled_value("IAM Profile", "{}", profile_name, _tags=tags)
 
+        # TODO: make changes here to log appropriately and setup config appropriately for flex-fleets. 
         if all(
             "KeyName" in node_type["node_config"]
             for node_type in config["available_node_types"].values()

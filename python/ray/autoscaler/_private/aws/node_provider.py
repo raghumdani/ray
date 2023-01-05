@@ -8,6 +8,7 @@ from typing import Any, Dict, List
 
 import botocore
 from boto3.resources.base import ServiceResource
+from botocore.client import BaseClient
 
 import ray._private.ray_constants as ray_constants
 from ray.autoscaler._private.aws.cloudwatch.cloudwatch_helper import (
@@ -62,6 +63,10 @@ def make_ec2_resource(region, max_retries, aws_credentials=None) -> ServiceResou
     aws_credentials = aws_credentials or {}
     return resource_cache("ec2", region, max_retries, **aws_credentials)
 
+def make_ec2_client(region, max_retries, aws_credentials=None) -> BaseClient:
+    """Make client, retrying requests up to `max_retries`."""
+    aws_credentials = aws_credentials or {}
+    return client_cache("ec2", region, max_retries, **aws_credentials)
 
 def list_ec2_instances(
     region: str, aws_credentials: Dict[str, Any] = None
@@ -108,6 +113,11 @@ class AWSNodeProvider(NodeProvider):
             aws_credentials=aws_credentials,
         )
         self.ec2_fail_fast = make_ec2_resource(
+            region=provider_config["region"],
+            max_retries=0,
+            aws_credentials=aws_credentials,
+        )
+        self.ec2_client_fail_fast = make_ec2_client(
             region=provider_config["region"],
             max_retries=0,
             aws_credentials=aws_credentials,
@@ -317,7 +327,12 @@ class AWSNodeProvider(NodeProvider):
 
         created_nodes_dict = {}
         if count:
-            created_nodes_dict = self._create_node(node_config, tags, count)
+            print(f"Node Config: {node_config}")
+            if "node_launch_method" in node_config and node_config["node_launch_method"] == 'create_fleet':
+                created_nodes_dict = self._create_node_fleet(node_config, tags, count)
+            else:
+                created_nodes_dict = self._create_node(node_config, tags, count)
+            
 
         all_created_nodes = reused_nodes_dict
         all_created_nodes.update(created_nodes_dict)
@@ -362,42 +377,17 @@ class AWSNodeProvider(NodeProvider):
         tags = to_aws_format(tags)
         conf = node_config.copy()
 
-        tag_pairs = [
-            {
-                "Key": TAG_RAY_CLUSTER_NAME,
-                "Value": self.cluster_name,
-            }
-        ]
-        for k, v in tags.items():
-            tag_pairs.append(
-                {
-                    "Key": k,
-                    "Value": v,
-                }
-            )
-        if CloudwatchHelper.cloudwatch_config_exists(self.provider_config, "agent"):
-            cwa_installed = self._check_ami_cwa_installation(node_config)
-            if cwa_installed:
-                tag_pairs.extend(
-                    [
-                        {
-                            "Key": CLOUDWATCH_AGENT_INSTALLED_TAG,
-                            "Value": "True",
-                        }
-                    ]
-                )
-        tag_specs = [
-            {
-                "ResourceType": "instance",
-                "Tags": tag_pairs,
-            }
-        ]
+        tag_specs = self._create_node_tag_specs(node_config, tags)
+
         user_tag_specs = conf.get("TagSpecifications", [])
         AWSNodeProvider._merge_tag_specs(tag_specs, user_tag_specs)
 
         # SubnetIds is not a real config key: we must resolve to a
         # single SubnetId before invoking the AWS API.
+        # see autoscaler/_private/aws/config.py
         subnet_ids = conf.pop("SubnetIds")
+        if "node_launch_method" in conf:
+            conf.pop("node_launch_method")
 
         # update config with min/max node counts and tag specs
         conf.update({"MinCount": 1, "MaxCount": count, "TagSpecifications": tag_specs})
@@ -476,6 +466,166 @@ class AWSNodeProvider(NodeProvider):
                     )
 
         return created_nodes_dict
+
+    def _create_node_fleet(self, node_config, tags, count):
+        created_nodes_dict = {}
+
+        tags = to_aws_format(tags)
+        conf = node_config.copy()
+
+        tag_specs = self._create_node_tag_specs(node_config, tags)
+        user_tag_specs = conf.get("TagSpecifications", [])
+        AWSNodeProvider._merge_tag_specs(tag_specs, user_tag_specs)
+
+        # SubnetIds is not a real config key: we must resolve to a
+        # single SubnetId before invoking the AWS API.
+        subnet_ids = conf.pop("SubnetIds")
+
+        # TODO: Only instant types will be supported as async node creation, explain why
+        conf.update({"Type": "instant"})
+
+        # update config with min/max node counts and tag specs
+        target_capacity_spec = conf.get("TargetCapacitySpecification", {})
+        target_capacity_spec.update({"TotalTargetCapacity": count})
+
+        # TODO: do validation. UnitType should always be units.
+        if "TargetCapacityUnitType" in target_capacity_spec:
+            target_capacity_spec.pop("TargetCapacityUnitType")
+        conf.update({"TargetCapacitySpecification": target_capacity_spec, "TagSpecifications": tag_specs})
+
+        # Try to always launch in the first listed subnet.
+        subnet_idx = 0
+        cli_logger_tags = {}
+        # NOTE: This ensures that we try ALL availability zones before
+        # throwing an error.
+        max_tries = max(BOTO_CREATE_MAX_RETRIES, len(subnet_ids))
+
+        if "IamInstanceProfile" in conf:
+            conf.pop("IamInstanceProfile")
+        if "node_launch_method" in conf:
+            conf.pop("node_launch_method")
+        if "KeyName" in conf:
+            conf.pop("KeyName")
+        if "SecurityGroupIds" in conf:
+            conf.pop("SecurityGroupIds")
+        if "ImageId" in conf:
+            conf.pop("ImageId")
+
+        for attempt in range(1, max_tries + 1):
+            try:
+                subnet_id = subnet_ids[subnet_idx % len(subnet_ids)]
+
+                for launch_template_cfg in conf["LaunchTemplateConfigs"]:
+                    overrides = launch_template_cfg.get("Overrides", [{}])
+                    for override in overrides:
+                        override.update({"SubnetId": subnet_id})
+                    launch_template_cfg["Overrides"] = overrides
+
+                cli_logger_tags["subnet_id"] = subnet_id
+
+
+                # TODO: sanitize the param auto-population in config.py
+
+                print(f'Request to fleet: {conf}')
+                fleet = self.ec2_client_fail_fast.create_fleet(**conf)
+
+                print(f"Created Fleet: {fleet}")
+
+                instance_ids = []
+                for lt_override in fleet['Instances']:
+                    instance_ids.extend(lt_override['InstanceIds'])
+
+                created = list(self.ec2.instances.filter(InstanceIds=instance_ids))
+                print(f"Create instances: {created}")
+                created_nodes_dict = {n.id: n for n in created}
+
+                # TODO: better error handling
+                # TODO: fleet type instant is only supported
+                # todo: timed?
+                # todo: handle plurality?
+                with cli_logger.group(
+                    "Launched {} nodes", count, _tags=cli_logger_tags
+                ):
+                    for instance in created:
+                        # NOTE(maximsmol): This is needed for mocking
+                        # boto3 for tests. This is likely a bug in moto
+                        # but AWS docs don't seem to say.
+                        # You can patch moto/ec2/responses/instances.py
+                        # to fix this (add <stateReason> to EC2_RUN_INSTANCES)
+
+                        # The correct value is technically
+                        # {"code": "0", "Message": "pending"}
+                        state_reason = instance.state_reason or {"Message": "pending"}
+
+                        cli_logger.print(
+                            "Launched instance {}",
+                            instance.instance_id,
+                            _tags=dict(
+                                state=instance.state["Name"],
+                                info=state_reason["Message"],
+                            ),
+                        )
+                break
+            except botocore.exceptions.ClientError as exc:
+                # Launch failure may be due to instance type availability in
+                # the given AZ
+                subnet_idx += 1
+                if attempt == max_tries:
+                    try:
+                        exc = NodeLaunchException(
+                            category=exc.response["Error"]["Code"],
+                            description=exc.response["Error"]["Message"],
+                            src_exc_info=sys.exc_info(),
+                        )
+                    except Exception:
+                        # In theory, all ClientError's we expect to get should
+                        # have these fields, but just in case we can't parse
+                        # it, it's fine, just throw the original error.
+                        logger.warning("Couldn't parse exception.", exc)
+                        pass
+                    cli_logger.abort(
+                        "Failed to launch instances. Max attempts exceeded.",
+                        exc=exc,
+                    )
+                else:
+                    cli_logger.warning(
+                        "create_instances: Attempt failed with {}, retrying.", exc
+                    )
+
+        return created_nodes_dict
+
+    def _create_node_tag_specs(self, node_config, tags):
+        tag_pairs = [
+            {
+                "Key": TAG_RAY_CLUSTER_NAME,
+                "Value": self.cluster_name,
+            }
+        ]
+        for k, v in tags.items():
+            tag_pairs.append(
+                {
+                    "Key": k,
+                    "Value": v,
+                }
+            )
+        if CloudwatchHelper.cloudwatch_config_exists(self.provider_config, "agent"):
+            cwa_installed = self._check_ami_cwa_installation(node_config)
+            if cwa_installed:
+                tag_pairs.extend(
+                    [
+                        {
+                            "Key": CLOUDWATCH_AGENT_INSTALLED_TAG,
+                            "Value": "True",
+                        }
+                    ]
+                )
+        tag_specs = [
+            {
+                "ResourceType": "instance",
+                "Tags": tag_pairs,
+            }
+        ]
+        return tag_specs
 
     def terminate_node(self, node_id):
         node = self._get_cached_node(node_id)
@@ -622,32 +772,125 @@ class AWSNodeProvider(NodeProvider):
         }
         available_node_types = cluster_config["available_node_types"]
         head_node_type = cluster_config["head_node_type"]
+
+        # TODO: modularize this code for better maintainability
         for node_type in available_node_types:
-            instance_type = available_node_types[node_type]["node_config"][
-                "InstanceType"
-            ]
-            if instance_type in instances_dict:
-                cpus = instances_dict[instance_type]["VCpuInfo"]["DefaultVCpus"]
+            node_launch_method = available_node_types[node_type]["node_config"].get("node_launch_method")
 
-                autodetected_resources = {"CPU": cpus}
-                if node_type != head_node_type:
-                    # we only autodetect worker node type memory resource
-                    memory_total = instances_dict[instance_type]["MemoryInfo"][
-                        "SizeInMiB"
-                    ]
-                    memory_total = int(memory_total) * 1024 * 1024
-                    prop = 1 - ray_constants.DEFAULT_OBJECT_STORE_MEMORY_PROPORTION
-                    memory_resources = int(memory_total * prop)
-                    autodetected_resources["memory"] = memory_resources
+            print(f"node_type: {node_type}, method: {node_launch_method}")
+            if node_launch_method is None or node_launch_method == 'create_instances':
+                instance_type = available_node_types[node_type]["node_config"][
+                    "InstanceType"
+                ]
+                if instance_type in instances_dict:
+                    cpus = instances_dict[instance_type]["VCpuInfo"]["DefaultVCpus"]
 
-                gpus = instances_dict[instance_type].get("GpuInfo", {}).get("Gpus")
-                if gpus is not None:
-                    # TODO(ameer): currently we support one gpu type per node.
-                    assert len(gpus) == 1
-                    gpu_name = gpus[0]["Name"]
+                    autodetected_resources = {"CPU": cpus}
+                    if node_type != head_node_type:
+                        # we only autodetect worker node type memory resource
+                        memory_total = instances_dict[instance_type]["MemoryInfo"][
+                            "SizeInMiB"
+                        ]
+                        memory_total = int(memory_total) * 1024 * 1024
+                        prop = 1 - ray_constants.DEFAULT_OBJECT_STORE_MEMORY_PROPORTION
+                        memory_resources = int(memory_total * prop)
+                        autodetected_resources["memory"] = memory_resources
+
+                    gpus = instances_dict[instance_type].get("GpuInfo", {}).get("Gpus")
+                    if gpus is not None:
+                        # TODO(ameer): currently we support one gpu type per node.
+                        assert len(gpus) == 1
+                        gpu_name = gpus[0]["Name"]
+                        autodetected_resources.update(
+                            {"GPU": gpus[0]["Count"], f"accelerator_type:{gpu_name}": 1}
+                        )
                     autodetected_resources.update(
-                        {"GPU": gpus[0]["Count"], f"accelerator_type:{gpu_name}": 1}
+                        available_node_types[node_type].get("resources", {})
                     )
+                    if autodetected_resources != available_node_types[node_type].get(
+                        "resources", {}
+                    ):
+                        available_node_types[node_type][
+                            "resources"
+                        ] = autodetected_resources
+                        logger.debug(
+                            "Updating the resources of {} to {}.".format(
+                                node_type, autodetected_resources
+                            )
+                        )
+                else:
+                    raise ValueError(
+                        "Instance type "
+                        + instance_type
+                        + " is not available in AWS region: "
+                        + cluster_config["provider"]["region"]
+                        + "."
+                    )
+            elif node_launch_method == "create_fleet":
+                launch_template_configs = available_node_types[node_type]["node_config"]["LaunchTemplateConfigs"]
+
+                autodetected_resources = {}
+                for launch_template_config in launch_template_configs:
+                    if "Overrides" in launch_template_config:
+                        overrides = launch_template_config["Overrides"]
+                        for override in overrides:
+                            if "InstanceType" in override:
+                                if override["InstanceType"] in instances_dict:
+                                    instance_type = override["InstanceType"]
+                                    instance_cpu = instances_dict[instance_type]["VCpuInfo"]["DefaultVCpus"]
+                                    if "CPU" in autodetected_resources and autodetected_resources["CPU"] != instance_cpu:
+                                        raise ValueError(f"All instance types specified must have equal amount of CPUs")
+
+                                    autodetected_resources.update({"CPU": instance_cpu})
+
+                                    if node_type != head_node_type:
+                                        instance_memory = instances_dict[instance_type]["MemoryInfo"]["SizeInMiB"]
+                                        memory_total = int(instance_memory) * 1024 * 1024
+                                        prop = 1 - ray_constants.DEFAULT_OBJECT_STORE_MEMORY_PROPORTION
+                                        memory_resources = int(memory_total * prop)
+                                        # TODO: pick maximum memory
+                                        autodetected_resources.update({"memory": memory_resources})
+                                    
+                                    gpus = instances_dict[instance_type].get("GpuInfo", {}).get("Gpus")
+                                    if "GPU" in autodetected_resources and autodetected_resources["GPU"] != gpus:
+                                        raise ValueError(f"All instance types specified must have equal amount of GPUs")
+                                    if gpus is not None:
+                                        assert len(gpus) == 1
+                                        gpu_name = gpus[0]["Name"]
+                                        autodetected_resources.update(
+                                            {"GPU": gpus[0]["Count"], f"accelerator_type:{gpu_name}": 1}
+                                        )
+                                else:
+                                    raise ValueError(
+                                        "Instance type "
+                                        + instance_type
+                                        + " is not available in AWS region: "
+                                        + cluster_config["provider"]["region"]
+                                        + "."
+                                    )
+                            elif "InstanceRequirements" in override:
+                                min_cpu = override["InstanceRequirements"].get("VCpuCount", {}).get("Min")
+                                max_cpu = override["InstanceRequirements"].get("VCpuCount", {}).get("Max")
+                                if min_cpu != max_cpu or ("CPU" in autodetected_resources and autodetected_resources["CPU"] != max_cpu):
+                                    raise ValueError(f"Min VCpuCount must be equal to Max VCpuCount and all instances must use same amount of CPUs")
+
+                                autodetected_resources.update({"CPU": max_cpu})
+
+                                if node_type != head_node_type:
+                                    min_memory_mib = override["InstanceRequirements"].get("MemoryMiB", {}).get("Min")
+                                    max_memory_mib = override["InstanceRequirements"].get("MemoryMiB", {}).get("Max")
+
+                                    memory_total = int(max_memory_mib) * 1024 * 1024
+                                    prop = 1 - ray_constants.DEFAULT_OBJECT_STORE_MEMORY_PROPORTION
+                                    memory_resources = int(memory_total * prop)
+                                    if min_memory_mib != max_memory_mib or ("memory" in autodetected_resources and autodetected_resources["memory"] != memory_resources):
+                                        raise ValueError(f"Min MemoryMiB must be equal to Max MemoryMiB and all instances must use same amount of memory")
+                                    autodetected_resources.update({"memory": memory_resources})
+
+                                # TODO: validate gpu accelerator types
+                            else:
+                                raise ValueError("Either InstanceType or InstanceRequirements must be part of config")
+
                 autodetected_resources.update(
                     available_node_types[node_type].get("resources", {})
                 )
@@ -662,12 +905,8 @@ class AWSNodeProvider(NodeProvider):
                             node_type, autodetected_resources
                         )
                     )
+
             else:
-                raise ValueError(
-                    "Instance type "
-                    + instance_type
-                    + " is not available in AWS region: "
-                    + cluster_config["provider"]["region"]
-                    + "."
-                )
+                raise ValueError(f"Invalid node_launch_method: {node_launch_method}. \
+                                Supported values=['create_fleet', 'create_instances', None]")
         return cluster_config
