@@ -268,6 +268,7 @@ class AWSNodeProvider(NodeProvider):
 
         reused_nodes_dict = {}
         # Try to reuse previously stopped nodes with compatible configs
+        print(f"Cache stopped nodes {self.cache_stopped_nodes}")
         if self.cache_stopped_nodes:
             # TODO(ekl) this is breaking the abstraction boundary a little by
             # peeking into the tag set.
@@ -534,6 +535,9 @@ class AWSNodeProvider(NodeProvider):
                 instance_ids = []
                 for lt_override in fleet['Instances']:
                     instance_ids.extend(lt_override['InstanceIds'])
+
+                if not instance_ids:
+                    raise RuntimeError("Unable to provision any instances")
 
                 created = list(self.ec2.instances.filter(InstanceIds=instance_ids))
                 print(f"Create instances: {created}")
