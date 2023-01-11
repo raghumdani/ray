@@ -268,7 +268,6 @@ class AWSNodeProvider(NodeProvider):
 
         reused_nodes_dict = {}
         # Try to reuse previously stopped nodes with compatible configs
-        print(f"Cache stopped nodes {self.cache_stopped_nodes}")
         if self.cache_stopped_nodes:
             # TODO(ekl) this is breaking the abstraction boundary a little by
             # peeking into the tag set.
@@ -328,7 +327,6 @@ class AWSNodeProvider(NodeProvider):
 
         created_nodes_dict = {}
         if count:
-            print(f"Node Config: {node_config}")
             if "node_launch_method" in node_config and node_config["node_launch_method"] == 'create_fleet':
                 created_nodes_dict = self._create_node_fleet(node_config, tags, count)
             else:
@@ -527,10 +525,7 @@ class AWSNodeProvider(NodeProvider):
 
                 # TODO: sanitize the param auto-population in config.py
 
-                print(f'Request to fleet: {conf}')
                 fleet = self.ec2_client_fail_fast.create_fleet(**conf)
-
-                print(f"Created Fleet: {fleet}")
 
                 instance_ids = []
                 for lt_override in fleet['Instances']:
@@ -540,7 +535,6 @@ class AWSNodeProvider(NodeProvider):
                     raise RuntimeError("Unable to provision any instances")
 
                 created = list(self.ec2.instances.filter(InstanceIds=instance_ids))
-                print(f"Create instances: {created}")
                 created_nodes_dict = {n.id: n for n in created}
 
                 # TODO: better error handling
@@ -781,7 +775,6 @@ class AWSNodeProvider(NodeProvider):
         for node_type in available_node_types:
             node_launch_method = available_node_types[node_type]["node_config"].get("node_launch_method")
 
-            print(f"node_type: {node_type}, method: {node_launch_method}")
             if node_launch_method is None or node_launch_method == 'create_instances':
                 instance_type = available_node_types[node_type]["node_config"][
                     "InstanceType"
